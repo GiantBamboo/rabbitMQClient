@@ -1,18 +1,22 @@
 import json
+import logging
 import queue
 import threading
 import time
 
 import pika
 
+# 设置日志记录格式和级别
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
 
 class ImageMQClient:
-    def _init_(self, config):
+    def __init__(self, config):
         self.credentials = pika.PlainCredentials(config["username"], config["password"])
         self.parameters = pika.ConnectionParameters(
             host=config["host"], port=config["port"], virtual_host="/", credentials=self.credentials
         )
-        self.connection = pika.BlockingConnection(self.parameters)
+        self.connection = self._connect()
         self.channel = self.connection.channel()
         self.taskID = config["taskID"]
         self.messageType = config["messageType"]
@@ -22,27 +26,34 @@ class ImageMQClient:
         self.worker_thread = threading.Thread(target=self._process_queue)  # 创建工作线程
         self.worker_thread.start()  # 启动工作线程
 
+    def _connect(self):
+        try:
+            return pika.BlockingConnection(self.parameters)
+        except pika.exceptions.AMQPConnectionError as e:
+            logging.error(f"Failed to connect to RabbitMQ: {e}")
+            raise
+
     def _encode_message(self, binary_data=None, binary_type=None):
-        raw_data = dict({
+        raw_data = {
             "json": {
                 "taskID": self.taskID,
                 "messageType": self.messageType,
                 "binary": []
             },
             "binary": []
-        })
+        }
 
         if binary_data is not None:
             if binary_type is not None:
-                for i in range(0, len(binary_data)):
+                for data in binary_data:
                     raw_data["json"]["binary"].append({
-                        "length": f"{len(binary_data[i])}",  # 使用 len 获取实际字节长度
+                        "length": f"{len(data)}",  # 使用 len 获取实际字节长度
                         "type": f"{binary_type}",
                         "timestamp": f"{time.time()}"
                     })
-                    raw_data["binary"].append(binary_data[i])
+                    raw_data["binary"].append(data)
             else:
-                print("No binary data type provided")
+                logging.warning("No binary data type provided")
 
         json_str = json.dumps(raw_data["json"])
         json_bytes = json_str.encode("utf-8")
@@ -77,6 +88,7 @@ class ImageMQClient:
     def publish(self, binary_data=None, binary_type=None):
         message = self._encode_message(binary_data, binary_type)
         self.message_queue.put(message)  # 将消息放入队列
+        logging.info("Message published to queue.")
 
     def _process_queue(self):
         while not self.stop_event.is_set():
@@ -94,30 +106,37 @@ class ImageMQClient:
                         }),
                 )
                 self.message_queue.task_done()
+                logging.info("Message processed from queue.")
             except queue.Empty:
                 continue
+            except Exception as e:
+                logging.error(f"Error while processing queue: {e}")
 
     def receive(self):
         def callback(ch, method, properties, body):
             decoded_message = self._decode_message(body)
-            print(f"Received message: {decoded_message}")
+            logging.info(f"Received message: {decoded_message}")
 
-        self.channel.exchange_declare(exchange=self.taskID, exchange_type="direct")
+        try:
+            self.channel.exchange_declare(exchange=self.taskID, exchange_type="direct")
+            self.channel.queue_declare(queue=self.messageType)
+            self.channel.queue_bind(exchange=self.taskID, queue=self.messageType, routing_key=self.messageType)
 
-        self.channel.queue_declare(queue=self.messageType)
-        self.channel.queue_bind(exchange=self.taskID, queue=self.messageType, routing_key=self.messageType)
+            self.channel.basic_consume(
+                queue=self.messageType, on_message_callback=callback, auto_ack=True
+            )
 
-        self.channel.basic_consume(
-            queue=self.messageType, on_message_callback=callback, auto_ack=True
-        )
-
-        print('Waiting for messages. To exit press CTRL+C')
-        self.channel.start_consuming()
+            logging.info('Waiting for messages. To exit press CTRL+C')
+            self.channel.start_consuming()
+        except Exception as e:
+            logging.error(f"Error while receiving messages: {e}")
 
     def close(self):
         self.stop_event.set()  # 设置停止事件
         self.worker_thread.join()  # 等待工作线程结束
-        self.connection.close()  # 关闭 RabbitMQ 连接
+        if self.connection.is_open:
+            self.connection.close()  # 关闭 RabbitMQ 连接
+        logging.info("Connection closed.")
 
 
 if __name__ == "__main__":
